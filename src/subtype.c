@@ -516,7 +516,7 @@ static int subtype_ccheck(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
     return sub;
 }
 
-static int subtype_left_var(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+static int subtype_left_var(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (x == y)
         return 1;
@@ -528,7 +528,7 @@ static int subtype_left_var(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
         return 1;
     if (x == (jl_value_t*)jl_any_type && jl_is_datatype(y))
         return 0;
-    return subtype(x, y, e, 0);
+    return subtype(x, y, e, param);
 }
 
 // use the current context to record where a variable occurred, for the purpose
@@ -566,10 +566,10 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
-        return e->ignore_free || subtype_left_var(b->ub, a, e);
+        return e->ignore_free || subtype_left_var(b->ub, a, e, param);
     record_var_occurrence(bb, e, param);
     if (!bb->right)  // check ∀b . b<:a
-        return subtype_left_var(bb->ub, a, e);
+        return subtype_left_var(bb->ub, a, e, param);
     if (bb->ub == a)
         return 1;
     if (!((bb->lb == jl_bottom_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ccheck(bb->lb, a, e)))
@@ -590,7 +590,7 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
         if (aa && !aa->right && in_union(bb->lb, a) && bb->depth0 != aa->depth0 && var_outside(e, b, (jl_tvar_t*)a)) {
             // an "exists" var cannot equal a "forall" var inside it unless the forall
             // var has equal bounds.
-            return subtype_left_var(aa->ub, aa->lb, e);
+            return subtype_left_var(aa->ub, aa->lb, e, param);
         }
     }
     return 1;
@@ -601,10 +601,10 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
-        return e->ignore_free || subtype_left_var(a, b->lb, e);
+        return e->ignore_free || subtype_left_var(a, b->lb, e, param);
     record_var_occurrence(bb, e, param);
     if (!bb->right)  // check ∀b . b>:a
-        return subtype_left_var(a, bb->lb, e);
+        return subtype_left_var(a, bb->lb, e, param);
     if (bb->lb == bb->ub) {
         if (jl_is_typevar(bb->lb) && !jl_is_type(a) && !jl_is_typevar(a))
             return var_gt((jl_tvar_t*)bb->lb, a, e, param);
@@ -618,7 +618,7 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
     if (jl_is_typevar(a)) {
         jl_varbinding_t *aa = lookup(e, (jl_tvar_t*)a);
         if (aa && !aa->right && bb->depth0 != aa->depth0 && param == 2 && var_outside(e, b, (jl_tvar_t*)a))
-            return subtype_left_var(aa->ub, aa->lb, e);
+            return subtype_left_var(aa->ub, aa->lb, e, param);
     }
     return 1;
 }
@@ -690,12 +690,42 @@ static int var_occurs_inside(jl_value_t *v, jl_tvar_t *var, int inside, int want
 
 typedef int (*tvar_callback)(void*, int8_t, jl_stenv_t *, int);
 
+static int var_occurs_invariant(jl_value_t *v, jl_tvar_t *var, int inv) JL_NOTSAFEPOINT
+{
+    if (v == (jl_value_t*)var) {
+        return inv;
+    }
+    else if (jl_is_uniontype(v)) {
+        return var_occurs_invariant(((jl_uniontype_t*)v)->a, var, inv) ||
+            var_occurs_invariant(((jl_uniontype_t*)v)->b, var, inv);
+    }
+    else if (jl_is_unionall(v)) {
+        jl_unionall_t *ua = (jl_unionall_t*)v;
+        if (ua->var == var)
+            return 0;
+        if (var_occurs_invariant(ua->var->lb, var, inv) || var_occurs_invariant(ua->var->ub, var, inv))
+            return 1;
+        return var_occurs_invariant(ua->body, var, inv);
+    }
+    else if (jl_is_datatype(v)) {
+        size_t i;
+        int ins = !jl_is_tuple_type(v);
+        int va = jl_is_vararg_type(v);
+        for (i=0; i < jl_nparams(v); i++) {
+            if (var_occurs_invariant(jl_tparam(v,i), var, va && i == 0 ? 0 : ins))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static int with_tvar(tvar_callback callback, void *context, jl_unionall_t *u, int8_t R, jl_stenv_t *e, int param)
 {
     jl_varbinding_t vb = { u->var, u->var->lb, u->var->ub, R, NULL, 0, 0, 0, 0,
                            R ? e->Rinvdepth : e->invdepth, 0, NULL, 0, e->vars };
     JL_GC_PUSH4(&u, &vb.lb, &vb.ub, &vb.innervars);
     e->vars = &vb;
+    vb.occurs_inv = var_occurs_invariant(u->body, u->var, 0);
     int ans;
     if (R) {
         e->envidx++;
@@ -2494,7 +2524,8 @@ static jl_value_t *intersect_unionall_(jl_value_t *t, jl_unionall_t *u, jl_stenv
     else {
         res = intersect(u->body, t, e, param);
     }
-    vb->concrete |= (!vb->occurs_inv && vb->occurs_cov > 1 && is_leaf_typevar(u->var));
+    int static_occurs_inv = var_occurs_invariant(u->body, u->var, 0);
+    vb->concrete |= (!static_occurs_inv && vb->occurs_cov > 1 && is_leaf_typevar(u->var));
 
     // handle the "diagonal dispatch" rule, which says that a type var occurring more
     // than once, and only in covariant position, is constrained to concrete types. E.g.
